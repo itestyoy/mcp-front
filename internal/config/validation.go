@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -161,11 +162,87 @@ func validateAuthStructure(auth map[string]any, result *ValidationResult) {
 				Message: "at least one allowed origin is required for OAuth (CORS configuration)",
 			})
 		}
+
+		validateRedirectURIHostStructure(auth, result)
 	default:
 		result.Errors = append(result.Errors, ValidationError{
 			Path:    "proxy.auth.kind",
 			Message: fmt.Sprintf("unknown auth kind '%s' - only 'oauth' is supported for proxy auth", kind),
 		})
+	}
+}
+
+// validateRedirectURIHostStructure checks the redirect-URI host policy
+// configuration. The policy is required at runtime in non-dev environments;
+// at static-lint time we warn rather than error so dev-only configs that
+// rely on MCP_FRONT_ENV=development aren't broken, while still nudging
+// operators toward being explicit.
+func validateRedirectURIHostStructure(auth map[string]any, result *ValidationResult) {
+	hostsRaw, hostsKeyPresent := auth["allowedRedirectUriHosts"]
+	hosts, hostsIsList := hostsRaw.([]any)
+	allowAny, _ := auth["allowAnyRedirectUriHost"].(bool)
+
+	if hostsKeyPresent && !hostsIsList {
+		result.Errors = append(result.Errors, ValidationError{
+			Path:    "proxy.auth.allowedRedirectUriHosts",
+			Message: "must be an array of origin strings (e.g. [\"https://claude.ai\"])",
+		})
+		return
+	}
+
+	hasHosts := hostsIsList && len(hosts) > 0
+
+	if hasHosts && allowAny {
+		result.Errors = append(result.Errors, ValidationError{
+			Path:    "proxy.auth.allowAnyRedirectUriHost",
+			Message: "cannot be true when allowedRedirectUriHosts is non-empty; choose one",
+		})
+	}
+
+	if !hasHosts && !allowAny {
+		result.Warnings = append(result.Warnings, ValidationError{
+			Path:    "proxy.auth.allowedRedirectUriHosts",
+			Message: "no redirect-URI host policy set; the server will fail to start unless MCP_FRONT_ENV=development. Set allowedRedirectUriHosts to a list of trusted client origins (e.g. [\"https://claude.ai\"]) or allowAnyRedirectUriHost: true to opt out explicitly",
+		})
+	}
+
+	for i, entry := range hosts {
+		path := fmt.Sprintf("proxy.auth.allowedRedirectUriHosts[%d]", i)
+		entryStr, ok := entry.(string)
+		if !ok {
+			result.Errors = append(result.Errors, ValidationError{
+				Path:    path,
+				Message: "must be a string",
+			})
+			continue
+		}
+		u, err := url.Parse(entryStr)
+		if err != nil {
+			result.Errors = append(result.Errors, ValidationError{
+				Path:    path,
+				Message: fmt.Sprintf("%q is not a valid URI: %v", entryStr, err),
+			})
+			continue
+		}
+		if u.Scheme == "" || u.Host == "" {
+			result.Errors = append(result.Errors, ValidationError{
+				Path:    path,
+				Message: fmt.Sprintf("%q must be in the form scheme://host[:port]", entryStr),
+			})
+			continue
+		}
+		if u.Path != "" && u.Path != "/" {
+			result.Errors = append(result.Errors, ValidationError{
+				Path:    path,
+				Message: fmt.Sprintf("%q must not include a path", entryStr),
+			})
+		}
+		if u.RawQuery != "" || u.Fragment != "" {
+			result.Errors = append(result.Errors, ValidationError{
+				Path:    path,
+				Message: fmt.Sprintf("%q must not include a query or fragment", entryStr),
+			})
+		}
 	}
 }
 
@@ -531,6 +608,8 @@ func validateDiscoveryDurations(discovery map[string]any, path string, result *V
 
 // validateServiceAuths validates service authentication configuration
 func validateServiceAuths(serviceAuths []any, serverName string, requiresUserToken bool, result *ValidationResult) {
+	resolvedNames := make(map[string]int, len(serviceAuths))
+	basicUsernames := make(map[string]int, len(serviceAuths))
 	for i, authInterface := range serviceAuths {
 		auth, ok := authInterface.(map[string]any)
 		if !ok {
@@ -550,13 +629,22 @@ func validateServiceAuths(serviceAuths []any, serverName string, requiresUserTok
 			continue
 		}
 
+		nameStr, _ := auth["name"].(string)
 		switch authType {
 		case "basic":
-			if _, ok := auth["username"]; !ok {
+			username, _ := auth["username"].(string)
+			if username == "" {
 				result.Errors = append(result.Errors, ValidationError{
 					Path:    fmt.Sprintf("mcpServers.%s.serviceAuths[%d].username", serverName, i),
 					Message: "username is required for basic auth",
 				})
+			} else if prev, dup := basicUsernames[username]; dup {
+				result.Errors = append(result.Errors, ValidationError{
+					Path:    fmt.Sprintf("mcpServers.%s.serviceAuths[%d].username", serverName, i),
+					Message: fmt.Sprintf("basic auth username %q already used by serviceAuths[%d]; usernames must be unique within a server's serviceAuths", username, prev),
+				})
+			} else {
+				basicUsernames[username] = i
 			}
 			if _, ok := auth["password"]; !ok {
 				result.Errors = append(result.Errors, ValidationError{
@@ -566,6 +654,9 @@ func validateServiceAuths(serviceAuths []any, serverName string, requiresUserTok
 			} else {
 				// Validate password uses env var reference
 				validatePasswordReference(auth["password"], fmt.Sprintf("mcpServers.%s.serviceAuths[%d].password", serverName, i), result)
+			}
+			if nameStr == "" && username != "" {
+				nameStr = username
 			}
 		case "bearer":
 			tokens, ok := auth["tokens"].([]any)
@@ -580,11 +671,34 @@ func validateServiceAuths(serviceAuths []any, serverName string, requiresUserTok
 					Message: "at least one token is required for bearer auth",
 				})
 			}
+			if nameStr == "" {
+				result.Errors = append(result.Errors, ValidationError{
+					Path:    fmt.Sprintf("mcpServers.%s.serviceAuths[%d].name", serverName, i),
+					Message: "bearer auth requires a `name` (used as the per-server identity, e.g. \"ci-runner\")",
+				})
+			}
 		default:
 			result.Errors = append(result.Errors, ValidationError{
 				Path:    fmt.Sprintf("mcpServers.%s.serviceAuths[%d].type", serverName, i),
 				Message: fmt.Sprintf("unknown service auth type '%s' - supported types: basic, bearer", authType),
 			})
+		}
+
+		if nameStr != "" {
+			lower := strings.ToLower(nameStr)
+			if !validServerNameRe.MatchString(lower) {
+				result.Errors = append(result.Errors, ValidationError{
+					Path:    fmt.Sprintf("mcpServers.%s.serviceAuths[%d].name", serverName, i),
+					Message: fmt.Sprintf("service auth name %q is invalid (must match %s)", nameStr, validServerNameRe.String()),
+				})
+			} else if prev, dup := resolvedNames[lower]; dup {
+				result.Errors = append(result.Errors, ValidationError{
+					Path:    fmt.Sprintf("mcpServers.%s.serviceAuths[%d].name", serverName, i),
+					Message: fmt.Sprintf("identity name %q already used by serviceAuths[%d]; names must be unique within a server's serviceAuths", lower, prev),
+				})
+			} else {
+				resolvedNames[lower] = i
+			}
 		}
 
 		// If server requires user token, validate that service auth provides one

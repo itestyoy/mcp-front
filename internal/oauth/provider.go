@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"github.com/stainless-api/mcp-front/internal/crypto"
-	jsonwriter "github.com/stainless-api/mcp-front/internal/json"
 	"github.com/stainless-api/mcp-front/internal/log"
+	"github.com/stainless-api/mcp-front/internal/servicecontext"
 )
 
 const userContextKey contextKey = "user_email"
@@ -50,36 +50,38 @@ func GenerateJWTSecret(providedSecret string) ([]byte, error) {
 	return secret, nil
 }
 
+// NewValidateTokenMiddleware tries to authenticate the request as an OAuth
+// Bearer token. On success it sets the OAuth user-email context and continues.
+// On any failure (missing header, wrong scheme, invalid signature, expired,
+// wrong audience) it passes through unchanged — the downstream RequireAuth
+// gate produces the 401 with the RFC 9728 Bearer challenge.
 func NewValidateTokenMiddleware(authServer *AuthorizationServer, issuer string, acceptIssuerAudience bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
 
-			serviceName := ExtractServiceNameFromPath(r.URL.Path, issuer)
-			metadataURI := ""
-			if serviceName != "" {
-				if uri, err := ServiceProtectedResourceMetadataURI(issuer, serviceName); err == nil {
-					metadataURI = uri
-				}
+			// If service auth already authenticated this request, skip JWT
+			// parsing — pure optimization, the gate would accept either way.
+			if _, ok := servicecontext.GetAuthInfo(ctx); ok {
+				next.ServeHTTP(w, r)
+				return
 			}
 
 			auth := r.Header.Get("Authorization")
 			if auth == "" {
-				jsonwriter.WriteUnauthorizedRFC9728(w, "Missing authorization header", metadataURI)
+				next.ServeHTTP(w, r)
 				return
 			}
-
 			parts := strings.Split(auth, " ")
 			if len(parts) != 2 || parts[0] != "Bearer" {
-				jsonwriter.WriteUnauthorizedRFC9728(w, "Invalid authorization header format", metadataURI)
+				next.ServeHTTP(w, r)
 				return
 			}
 
-			token := parts[1]
-
-			claims, err := authServer.ValidateAccessToken(token)
+			claims, err := authServer.ValidateAccessToken(parts[1])
 			if err != nil {
-				jsonwriter.WriteUnauthorizedRFC9728(w, "Invalid or expired token", metadataURI)
+				log.LogTraceWithFields("oauth", "Token validation failed", map[string]any{"error": err.Error()})
+				next.ServeHTTP(w, r)
 				return
 			}
 
@@ -89,17 +91,23 @@ func NewValidateTokenMiddleware(authServer *AuthorizationServer, issuer string, 
 					"audience": claims.Audience,
 					"error":    err.Error(),
 				})
-				jsonwriter.WriteUnauthorizedRFC9728(w, "Token audience does not match requested service", metadataURI)
+				next.ServeHTTP(w, r)
 				return
 			}
 
-			userEmail := claims.Identity.Email
-			if userEmail != "" {
-				ctx = context.WithValue(ctx, userContextKey, userEmail)
-				r = r.WithContext(ctx)
+			// Defense in depth: reject any token whose identity claims the
+			// reserved service-auth domain (validateAccess catches this at
+			// callback time; this catches refreshed/pre-existing tokens).
+			if at := strings.LastIndexByte(claims.Identity.Email, '@'); at >= 0 && servicecontext.IsReservedDomain(claims.Identity.Email[at+1:]) {
+				log.LogErrorWithFields("oauth", "rejected token with reserved service-auth domain in identity", map[string]any{
+					"email": claims.Identity.Email,
+				})
+				next.ServeHTTP(w, r)
+				return
 			}
 
-			next.ServeHTTP(w, r)
+			ctx = context.WithValue(ctx, userContextKey, claims.Identity.Email)
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }

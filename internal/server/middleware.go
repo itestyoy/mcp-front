@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -173,95 +174,143 @@ func NewRecoverMiddleware(prefix string) MiddlewareFunc {
 	}
 }
 
-// NewServiceAuthMiddleware creates middleware for service-to-service authentication
-func NewServiceAuthMiddleware(serviceAuths []config.ServiceAuth) MiddlewareFunc {
+// ServiceAuthDomain re-exports servicecontext.IdentityDomain for callers
+// that already use the server package.
+const ServiceAuthDomain = servicecontext.IdentityDomain
+
+// NewServiceAuthMiddleware tries to authenticate against serviceAuths. On
+// success it sets both oauth.userContextKey (with synthetic email
+// `<server>.<name>@serviceauth.mcpfront.alt`) and servicecontext.WithAuthInfo
+// (carrying the configured userToken), then continues. On any failure it
+// passes through — the RequireAuth gate produces the 401.
+//
+// Basic auth runs bcrypt against a dummy hash on no-match to equalize timing
+// against unknown usernames.
+func NewServiceAuthMiddleware(serverName string, serviceAuths []config.ServiceAuth) MiddlewareFunc {
+	dummyBasicHash, err := bcrypt.GenerateFromPassword([]byte("mcp-front-dummy-password"), bcrypt.DefaultCost)
+	if err != nil {
+		panic(fmt.Sprintf("service auth: failed to generate dummy bcrypt hash: %v", err))
+	}
+
+	identityPrefix := strings.ToLower(serverName) + "."
+	authenticated := func(r *http.Request, entry *config.ServiceAuth) *http.Request {
+		identity := identityPrefix + entry.Name + "@" + ServiceAuthDomain
+		ctx := context.WithValue(r.Context(), oauth.GetUserContextKey(), identity)
+		ctx = servicecontext.WithAuthInfo(ctx, identity, string(entry.UserToken))
+		return r.WithContext(ctx)
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx := r.Context()
-
-			// Check if user context is already set — OAuth succeeded, no need for further auth
-			if userEmail, ok := oauth.GetUserFromContext(ctx); ok && userEmail != "" {
-				log.LogTraceWithFields("service_auth", "Skipping service auth, user already authenticated via OAuth", map[string]any{
-					"user": userEmail,
-				})
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
-				log.LogTraceWithFields("service_auth", "Service auth failed: missing Authorization header", nil)
+			if token, ok := strings.CutPrefix(authHeader, "Bearer "); ok {
+				log.LogTraceWithFields("service_auth", "Attempting bearer token service auth", nil)
+				for i := range serviceAuths {
+					sa := &serviceAuths[i]
+					if sa.Type != config.ServiceAuthTypeBearer {
+						continue
+					}
+					if slices.Contains(sa.Tokens, token) {
+						log.LogTraceWithFields("service_auth", "Bearer token service auth successful", map[string]any{"name": sa.Name})
+						next.ServeHTTP(w, authenticated(r, sa))
+						return
+					}
+				}
+				log.LogTraceWithFields("service_auth", "Bearer token service auth: no match", nil)
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			if encoded, ok := strings.CutPrefix(authHeader, "Basic "); ok {
+				log.LogTraceWithFields("service_auth", "Attempting basic service auth", nil)
+				decoded, err := base64.StdEncoding.DecodeString(encoded)
+				if err != nil {
+					log.LogTraceWithFields("service_auth", "Basic service auth: invalid base64", map[string]any{"error": err.Error()})
+					next.ServeHTTP(w, r)
+					return
+				}
+				credentials := string(decoded)
+				colonIdx := strings.IndexByte(credentials, ':')
+				if colonIdx == -1 {
+					log.LogTraceWithFields("service_auth", "Basic service auth: malformed credentials", nil)
+					next.ServeHTTP(w, r)
+					return
+				}
+				username := credentials[:colonIdx]
+				password := credentials[colonIdx+1:]
+
+				var matched *config.ServiceAuth
+				for i := range serviceAuths {
+					sa := &serviceAuths[i]
+					if sa.Type != config.ServiceAuthTypeBasic {
+						continue
+					}
+					if username == sa.Username {
+						matched = sa
+						break
+					}
+				}
+				hashToCompare := dummyBasicHash
+				if matched != nil {
+					hashToCompare = []byte(string(matched.HashedPassword))
+				}
+				bcryptErr := bcrypt.CompareHashAndPassword(hashToCompare, []byte(password))
+				if matched != nil && bcryptErr == nil {
+					log.LogTraceWithFields("service_auth", "Basic service auth successful", map[string]any{"name": matched.Name})
+					next.ServeHTTP(w, authenticated(r, matched))
+					return
+				}
+				log.LogTraceWithFields("service_auth", "Basic service auth: no match", nil)
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// NewRequireAuthMiddleware is the policy gate at the end of the auth chain. It
+// passes through requests that any upstream trier authenticated (OAuth user or
+// service auth info), and produces the 401 + WWW-Authenticate response for
+// everything else. The shape of the challenge depends on the deployment:
+//   - oauthEnabled: RFC 9728 Bearer challenge with the per-service
+//     resource_metadata URI derived from the request path
+//   - service-auth-only: Basic realm="mcp-front"
+func NewRequireAuthMiddleware(oauthEnabled bool, issuer string) MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := r.Context()
+			// Either authenticator marks success by setting its context key.
+			// We check presence (ok), not value: an OAuth token with an empty
+			// email claim is still a successfully-validated token and should
+			// pass — the rejection of empty-email identities happens earlier
+			// in the OAuth flow, not at the per-request gate.
+			if _, ok := oauth.GetUserFromContext(ctx); ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if _, ok := servicecontext.GetAuthInfo(ctx); ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			if !oauthEnabled {
+				w.Header().Set("WWW-Authenticate", `Basic realm="mcp-front"`)
 				jsonwriter.WriteUnauthorized(w, "Unauthorized")
 				return
 			}
 
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				token := authHeader[7:]
-				log.LogTraceWithFields("service_auth", "Attempting bearer token service auth", nil)
-				for _, serviceAuth := range serviceAuths {
-					if serviceAuth.Type != config.ServiceAuthTypeBearer {
-						continue
-					}
-
-					if slices.Contains(serviceAuth.Tokens, token) {
-						// Auth succeeded
-						log.LogTraceWithFields("service_auth", "Bearer token service auth successful", map[string]any{
-							"service_name": "service",
-						})
-						ctx := servicecontext.WithAuthInfo(r.Context(), "service", string(serviceAuth.UserToken))
-						next.ServeHTTP(w, r.WithContext(ctx))
-						return
-					}
+			metadataURI := ""
+			if serviceName := oauth.ExtractServiceNameFromPath(r.URL.Path, issuer); serviceName != "" {
+				if uri, err := oauth.ServiceProtectedResourceMetadataURI(issuer, serviceName); err == nil {
+					metadataURI = uri
 				}
-				log.LogTraceWithFields("service_auth", "Bearer token service auth failed: invalid token", nil)
 			}
-
-			if strings.HasPrefix(authHeader, "Basic ") {
-				encoded := authHeader[6:]
-				log.LogTraceWithFields("service_auth", "Attempting basic service auth", nil)
-				decoded, err := base64.StdEncoding.DecodeString(encoded)
-				if err != nil {
-					log.LogTraceWithFields("service_auth", "Basic service auth failed: invalid base64 encoding", map[string]any{
-						"error": err.Error(),
-					})
-					w.Header().Set("WWW-Authenticate", `Basic realm="mcp-front"`)
-					jsonwriter.WriteUnauthorized(w, "Unauthorized")
-					return
-				}
-
-				credentials := string(decoded)
-				colonIdx := strings.IndexByte(credentials, ':')
-				if colonIdx == -1 {
-					log.LogTraceWithFields("service_auth", "Basic service auth failed: malformed credentials", nil)
-					w.Header().Set("WWW-Authenticate", `Basic realm="mcp-front"`)
-					jsonwriter.WriteUnauthorized(w, "Unauthorized")
-					return
-				}
-
-				username := credentials[:colonIdx]
-				password := credentials[colonIdx+1:]
-
-				for _, serviceAuth := range serviceAuths {
-					if serviceAuth.Type != config.ServiceAuthTypeBasic {
-						continue
-					}
-
-					if username == serviceAuth.Username {
-						if err := bcrypt.CompareHashAndPassword([]byte(string(serviceAuth.HashedPassword)), []byte(password)); err == nil {
-							// Auth succeeded
-							log.LogTraceWithFields("service_auth", "Basic service auth successful", map[string]any{
-								"username": username,
-							})
-							ctx := servicecontext.WithAuthInfo(r.Context(), serviceAuth.Username, string(serviceAuth.UserToken))
-							next.ServeHTTP(w, r.WithContext(ctx))
-							return
-						}
-					}
-				}
-				log.LogTraceWithFields("service_auth", "Basic service auth failed: invalid username or password", nil)
-			}
-
-			jsonwriter.WriteUnauthorized(w, "Unauthorized")
+			jsonwriter.WriteUnauthorizedRFC9728(w, "Missing or invalid credentials", metadataURI)
 		})
 	}
 }

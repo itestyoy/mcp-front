@@ -50,6 +50,24 @@ func (c *MCPClientConfig) UnmarshalJSON(data []byte) error {
 	c.RequiresUserToken = raw.RequiresUserToken
 	c.UserAuthentication = raw.UserAuthentication
 	c.ServiceAuths = raw.ServiceAuths
+	if len(c.ServiceAuths) > 0 {
+		seenNames := make(map[string]int, len(c.ServiceAuths))
+		seenUsernames := make(map[string]int, len(c.ServiceAuths))
+		for i, sa := range c.ServiceAuths {
+			if prev, dup := seenNames[sa.Name]; dup {
+				return fmt.Errorf("serviceAuths[%d] and serviceAuths[%d] both resolve to identity name %q; names must be unique within a server's serviceAuths", prev, i, sa.Name)
+			}
+			seenNames[sa.Name] = i
+			// Basic auth is matched at runtime by Username; duplicates
+			// silently shadow each other regardless of `name`.
+			if sa.Type == ServiceAuthTypeBasic {
+				if prev, dup := seenUsernames[sa.Username]; dup {
+					return fmt.Errorf("basic auth username %q already used by serviceAuths[%d]; usernames must be unique within a server's serviceAuths", sa.Username, prev)
+				}
+				seenUsernames[sa.Username] = i
+			}
+		}
+	}
 	c.InlineConfig = raw.InlineConfig
 	if c.Type == ServerTypeAggregate {
 		c.Delimiter = raw.Delimiter
@@ -201,6 +219,8 @@ func (o *OAuthAuthConfig) UnmarshalJSON(data []byte) error {
 		IDP                             json.RawMessage `json:"idp"`
 		AllowedDomains                  []string        `json:"allowedDomains"`
 		AllowedOrigins                  []string        `json:"allowedOrigins"`
+		AllowedRedirectURIHosts         []string        `json:"allowedRedirectUriHosts"`
+		AllowAnyRedirectURIHost         bool            `json:"allowAnyRedirectUriHost"`
 		TokenTTL                        string          `json:"tokenTtl"`
 		RefreshTokenTTL                 string          `json:"refreshTokenTtl"`
 		RefreshTokenScopes              []string        `json:"refreshTokenScopes"`
@@ -222,6 +242,8 @@ func (o *OAuthAuthConfig) UnmarshalJSON(data []byte) error {
 	o.Kind = raw.Kind
 	o.AllowedDomains = raw.AllowedDomains
 	o.AllowedOrigins = raw.AllowedOrigins
+	o.AllowedRedirectURIHosts = raw.AllowedRedirectURIHosts
+	o.AllowAnyRedirectURIHost = raw.AllowAnyRedirectURIHost
 	o.Storage = raw.Storage
 	o.FirestoreDatabase = raw.FirestoreDatabase
 	o.FirestoreCollection = raw.FirestoreCollection
@@ -579,6 +601,9 @@ func (s *ServiceAuth) UnmarshalJSON(data []byte) error {
 		if parsed.needsUserToken {
 			return fmt.Errorf("password cannot be a user token reference")
 		}
+		if parsed.value == "" {
+			return fmt.Errorf("basic auth password cannot be empty")
+		}
 
 		// Hash the password using bcrypt
 		log.LogTraceWithFields("config", "Hashing password for basic auth", map[string]any{
@@ -606,7 +631,6 @@ func (s *ServiceAuth) UnmarshalJSON(data []byte) error {
 		s.UserToken = Secret(parsed.value)
 	}
 
-	// Validate required fields based on type
 	switch s.Type {
 	case ServiceAuthTypeBasic:
 		if s.Username == "" {
@@ -615,13 +639,29 @@ func (s *ServiceAuth) UnmarshalJSON(data []byte) error {
 		if s.PasswordRaw == nil {
 			return fmt.Errorf("password is required for basic auth")
 		}
+		if s.Name == "" {
+			s.Name = s.Username
+		}
 	case ServiceAuthTypeBearer:
 		if len(s.Tokens) == 0 {
 			return fmt.Errorf("at least one token is required for bearer auth")
 		}
+		for i, tok := range s.Tokens {
+			if tok == "" {
+				return fmt.Errorf("bearer auth token at index %d cannot be empty", i)
+			}
+		}
+		if s.Name == "" {
+			return fmt.Errorf("bearer auth requires a `name` (used as the per-server identity, e.g. \"ci-runner\")")
+		}
 	default:
 		return fmt.Errorf("unknown service auth type: %s", s.Type)
 	}
+
+	if !validServerNameRe.MatchString(s.Name) {
+		return fmt.Errorf("service auth name %q is invalid (must match %s)", s.Name, validServerNameRe.String())
+	}
+	s.Name = strings.ToLower(s.Name)
 
 	return nil
 }

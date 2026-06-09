@@ -2,28 +2,33 @@ package servicecontext
 
 import (
 	"context"
+	"strings"
 )
 
 type contextKey string
 
-const (
-	userKey        contextKey = "auth.user"
-	serviceAuthKey contextKey = "auth.service"
-)
+const serviceAuthKey contextKey = "auth.service"
 
-// Info contains service authentication details
+// IdentityDomain is the synthetic email domain used for service-auth
+// identities (`<server>.<name>@serviceauth.mcpfront.alt`). RFC 9476 reserves
+// .alt for non-DNS namespaces, so this can never collide with a real user
+// email. The OAuth flow rejects any IDP-claimed identity in this domain.
+const IdentityDomain = "serviceauth.mcpfront.alt"
+
+// IsReservedDomain reports whether domain is the reserved service-auth
+// domain or any subdomain of it. Used by the OAuth flow to reject
+// IDP-claimed identities that would impersonate a service-auth principal.
+func IsReservedDomain(domain string) bool {
+	return domain == IdentityDomain || strings.HasSuffix(domain, "."+IdentityDomain)
+}
+
+// Info contains service authentication details.
 type Info struct {
 	ServiceName string
 	UserToken   string
 }
 
-// GetUser retrieves the username from context (for basic auth)
-func GetUser(ctx context.Context) (string, bool) {
-	username, ok := ctx.Value(userKey).(string)
-	return username, ok
-}
-
-// WithAuthInfo adds service authentication info to the context
+// WithAuthInfo adds service authentication info to the context.
 func WithAuthInfo(ctx context.Context, serviceName, userToken string) context.Context {
 	return context.WithValue(ctx, serviceAuthKey, Info{
 		ServiceName: serviceName,
@@ -31,17 +36,8 @@ func WithAuthInfo(ctx context.Context, serviceName, userToken string) context.Co
 	})
 }
 
-// GetAuthInfo retrieves service auth info from context
+// GetAuthInfo retrieves service auth info from context.
 func GetAuthInfo(ctx context.Context) (Info, bool) {
 	info, ok := ctx.Value(serviceAuthKey).(Info)
 	return info, ok
-}
-
-// GetServiceName retrieves the service name from context
-func GetServiceName(ctx context.Context) (string, bool) {
-	info, ok := GetAuthInfo(ctx)
-	if !ok {
-		return "", false
-	}
-	return info.ServiceName, true
 }

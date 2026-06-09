@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const DefaultAggregateDelimiter = "."
+const DefaultAggregateDelimiter = "__"
 
 // Secret is a string type that redacts itself when printed
 type Secret string
@@ -108,6 +108,10 @@ const (
 // ServiceAuth represents authentication method for service-to-service communication
 type ServiceAuth struct {
 	Type ServiceAuthType `json:"type"`
+
+	// Name is the per-server identity for this entry. Required for Bearer;
+	// defaults to Username for Basic.
+	Name string `json:"name,omitempty"`
 
 	// For basic auth
 	Username    string          `json:"username,omitempty"`
@@ -254,21 +258,35 @@ type IDPConfig struct {
 
 // OAuthAuthConfig represents OAuth 2.0 configuration with resolved values
 type OAuthAuthConfig struct {
-	Kind                AuthKind      `json:"kind"`
-	Issuer              string        `json:"issuer"`
-	GCPProject          string        `json:"gcpProject"`
-	IDP                 IDPConfig     `json:"idp"`
-	AllowedDomains      []string      `json:"allowedDomains"` // For domain-based access control
-	AllowedOrigins      []string      `json:"allowedOrigins"` // For CORS validation
-	TokenTTL            time.Duration `json:"tokenTtl"`
-	RefreshTokenTTL     time.Duration `json:"refreshTokenTtl"`
-	RefreshTokenScopes  []string      `json:"refreshTokenScopes"`
-	Storage             string        `json:"storage"`                       // "memory", "firestore", or "sqlite"
-	FirestoreDatabase   string        `json:"firestoreDatabase,omitempty"`   // Optional: Firestore database name
-	FirestoreCollection string        `json:"firestoreCollection,omitempty"` // Optional: Firestore collection name
-	SQLitePath          string        `json:"sqlitePath,omitempty"`          // Optional: SQLite database file path
-	JWTSecret           Secret        `json:"jwtSecret"`
-	EncryptionKey       Secret        `json:"encryptionKey"`
+	Kind           AuthKind  `json:"kind"`
+	Issuer         string    `json:"issuer"`
+	GCPProject     string    `json:"gcpProject"`
+	IDP            IDPConfig `json:"idp"`
+	AllowedDomains []string  `json:"allowedDomains"` // For domain-based access control
+	AllowedOrigins []string  `json:"allowedOrigins"` // For CORS validation
+	// AllowedRedirectURIHosts is the allowlist of permitted redirect-URI
+	// origins for OAuth client registration and authorization. Each entry is
+	// an origin in the form "scheme://host[:port]" (e.g. "https://claude.ai").
+	// A registered redirect URI passes when its scheme + hostname match an
+	// entry; if the entry omits a port any port matches, otherwise the port
+	// must match exactly. Required in non-dev environments unless
+	// AllowAnyRedirectURIHost is set.
+	AllowedRedirectURIHosts []string `json:"allowedRedirectUriHosts,omitempty"`
+	// AllowAnyRedirectURIHost explicitly disables the redirect-URI host
+	// allowlist. Structural checks (absolute URI, no fragment, hierarchical
+	// scheme with host) still apply. Required to boot in non-dev when
+	// AllowedRedirectURIHosts is empty. Cannot be combined with a non-empty
+	// AllowedRedirectURIHosts.
+	AllowAnyRedirectURIHost bool          `json:"allowAnyRedirectUriHost,omitempty"`
+	TokenTTL                time.Duration `json:"tokenTtl"`
+	RefreshTokenTTL         time.Duration `json:"refreshTokenTtl"`
+	RefreshTokenScopes      []string      `json:"refreshTokenScopes"`
+	Storage                 string        `json:"storage"`                       // "memory", "firestore", or "sqlite"
+	FirestoreDatabase       string        `json:"firestoreDatabase,omitempty"`   // Optional: Firestore database name
+	FirestoreCollection     string        `json:"firestoreCollection,omitempty"` // Optional: Firestore collection name
+	SQLitePath              string        `json:"sqlitePath,omitempty"`          // Optional: SQLite database file path
+	JWTSecret               Secret        `json:"jwtSecret"`
+	EncryptionKey           Secret        `json:"encryptionKey"`
 	// DangerouslyAcceptIssuerAudience allows tokens with just the base issuer as audience
 	// to be accepted for any service. This is a workaround for MCP clients that don't
 	// properly implement RFC 8707 resource indicators, but it defeats per-service token

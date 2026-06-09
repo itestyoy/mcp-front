@@ -4,9 +4,12 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/stainless-api/mcp-front/internal/config"
+	"github.com/stainless-api/mcp-front/internal/oauth"
 	"github.com/stainless-api/mcp-front/internal/servicecontext"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -166,176 +169,170 @@ func TestCorsMiddleware_MultipleOrigins(t *testing.T) {
 	}
 }
 
+// TestServiceAuthMiddleware verifies the trier semantics of NewServiceAuthMiddleware:
+// on a successful match it sets servicecontext and the wrapped handler runs;
+// on any other input it passes through unchanged (no auth context, no 401).
+// The 401 is the responsibility of the downstream RequireAuth gate, exercised
+// separately in TestRequireAuthMiddleware.
 func TestServiceAuthMiddleware(t *testing.T) {
-	// Create a hashed password for basic auth tests
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte("password123"), bcrypt.DefaultCost)
 	require.NoError(t, err)
 
-	serviceAuths := []config.ServiceAuth{
-		{
-			Type:   config.ServiceAuthTypeBearer,
-			Tokens: []string{"valid-token-1", "valid-token-2"},
-		},
-		{
-			Type:           config.ServiceAuthTypeBasic,
-			Username:       "user",
-			HashedPassword: config.Secret(hashedPassword),
-		},
-	}
-
-	tests := []struct {
-		name           string
-		authHeader     string
-		expectStatus   int
-		expectUsername string // For context check
-	}{
-		{
-			name:         "valid bearer token",
-			authHeader:   "Bearer valid-token-1",
-			expectStatus: http.StatusOK,
-		},
-		{
-			name:         "another valid bearer token",
-			authHeader:   "Bearer valid-token-2",
-			expectStatus: http.StatusOK,
-		},
-		{
-			name:         "invalid bearer token",
-			authHeader:   "Bearer invalid-token",
-			expectStatus: http.StatusUnauthorized,
-		},
-		{
-			name:         "valid basic auth",
-			authHeader:   "Basic " + base64.StdEncoding.EncodeToString([]byte("user:password123")),
-			expectStatus: http.StatusOK,
-		},
-		{
-			name:         "invalid basic auth password",
-			authHeader:   "Basic " + base64.StdEncoding.EncodeToString([]byte("user:wrongpassword")),
-			expectStatus: http.StatusUnauthorized,
-		},
-		{
-			name:         "invalid basic auth user",
-			authHeader:   "Basic " + base64.StdEncoding.EncodeToString([]byte("wronguser:password123")),
-			expectStatus: http.StatusUnauthorized,
-		},
-		{
-			name:         "malformed basic auth header",
-			authHeader:   "Basic malformed",
-			expectStatus: http.StatusUnauthorized,
-		},
-		{
-			name:         "no auth header",
-			authHeader:   "",
-			expectStatus: http.StatusUnauthorized,
-		},
-		{
-			name:         "unsupported auth scheme",
-			authHeader:   "Unsupported scheme",
-			expectStatus: http.StatusUnauthorized,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create a test handler
-			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusOK)
-			})
-
-			// Wrap with the service auth middleware
-			authHandler := NewServiceAuthMiddleware(serviceAuths)(handler)
-
-			// Create request
-			req := httptest.NewRequest("GET", "/test", nil)
-			if tt.authHeader != "" {
-				req.Header.Set("Authorization", tt.authHeader)
-			}
-
-			// Execute request
-			rr := httptest.NewRecorder()
-			authHandler.ServeHTTP(rr, req)
-
-			// Check status code
-			assert.Equal(t, tt.expectStatus, rr.Code)
-		})
-	}
-}
-
-func TestServiceAuthMiddleware_Context(t *testing.T) {
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte("password123"), bcrypt.DefaultCost)
-	require.NoError(t, err)
-
+	const serverName = "Postgres" // mixed case to verify lowercase canonicalization
 	serviceAuths := []config.ServiceAuth{
 		{
 			Type:      config.ServiceAuthTypeBearer,
-			Tokens:    []string{"valid-token"},
+			Name:      "ci",
+			Tokens:    []string{"valid-token-1", "valid-token-2"},
 			UserToken: config.Secret("bearer-user-token"),
 		},
 		{
 			Type:           config.ServiceAuthTypeBasic,
+			Name:           "user",
 			Username:       "user",
 			HashedPassword: config.Secret(hashedPassword),
 			UserToken:      config.Secret("basic-user-token"),
 		},
 	}
 
+	const (
+		bearerIdentity = "postgres.ci@" + ServiceAuthDomain
+		basicIdentity  = "postgres.user@" + ServiceAuthDomain
+	)
+
 	tests := []struct {
-		name              string
-		authHeader        string
-		expectStatus      int
-		expectServiceAuth bool
-		expectAuthInfo    servicecontext.Info
+		name           string
+		authHeader     string
+		wantAuthInfo   bool
+		wantAuthInfoEq servicecontext.Info
+		wantOAuthEmail string
 	}{
 		{
-			name:              "bearer token sets context",
-			authHeader:        "Bearer valid-token",
-			expectStatus:      http.StatusOK,
-			expectServiceAuth: true,
-			expectAuthInfo: servicecontext.Info{
-				ServiceName: "service",
-				UserToken:   "bearer-user-token",
-			},
+			name:           "valid bearer token",
+			authHeader:     "Bearer valid-token-1",
+			wantAuthInfo:   true,
+			wantAuthInfoEq: servicecontext.Info{ServiceName: bearerIdentity, UserToken: "bearer-user-token"},
+			wantOAuthEmail: bearerIdentity,
 		},
 		{
-			name:              "basic auth sets context",
-			authHeader:        "Basic " + base64.StdEncoding.EncodeToString([]byte("user:password123")),
-			expectStatus:      http.StatusOK,
-			expectServiceAuth: true,
-			expectAuthInfo: servicecontext.Info{
-				ServiceName: "user",
-				UserToken:   "basic-user-token",
-			},
+			name:           "another valid bearer token",
+			authHeader:     "Bearer valid-token-2",
+			wantAuthInfo:   true,
+			wantAuthInfoEq: servicecontext.Info{ServiceName: bearerIdentity, UserToken: "bearer-user-token"},
+			wantOAuthEmail: bearerIdentity,
 		},
 		{
-			name:              "invalid auth does not set context",
-			authHeader:        "Bearer invalid-token",
-			expectStatus:      http.StatusUnauthorized,
-			expectServiceAuth: false,
+			name:           "valid basic auth",
+			authHeader:     "Basic " + base64.StdEncoding.EncodeToString([]byte("user:password123")),
+			wantAuthInfo:   true,
+			wantAuthInfoEq: servicecontext.Info{ServiceName: basicIdentity, UserToken: "basic-user-token"},
+			wantOAuthEmail: basicIdentity,
 		},
+		{name: "invalid bearer token passes through", authHeader: "Bearer invalid-token"},
+		{name: "invalid basic password passes through", authHeader: "Basic " + base64.StdEncoding.EncodeToString([]byte("user:wrongpassword"))},
+		{name: "unknown basic user passes through", authHeader: "Basic " + base64.StdEncoding.EncodeToString([]byte("wronguser:password123"))},
+		{name: "malformed basic header passes through", authHeader: "Basic malformed"},
+		{name: "missing colon in basic passes through", authHeader: "Basic " + base64.StdEncoding.EncodeToString([]byte("usernopassword"))},
+		{name: "no auth header passes through", authHeader: ""},
+		{name: "unsupported scheme passes through", authHeader: "Unsupported scheme"},
+		{name: "empty bearer token passes through", authHeader: "Bearer "},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var actualAuthInfo servicecontext.Info
-			var hasAuthInfo bool
+			var gotAuthInfo servicecontext.Info
+			var gotHasAuthInfo bool
+			var gotOAuthEmail string
+			var handlerCalled bool
 
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				actualAuthInfo, hasAuthInfo = servicecontext.GetAuthInfo(r.Context())
+				handlerCalled = true
+				gotAuthInfo, gotHasAuthInfo = servicecontext.GetAuthInfo(r.Context())
+				gotOAuthEmail, _ = oauth.GetUserFromContext(r.Context())
 				w.WriteHeader(http.StatusOK)
 			})
 
-			authHandler := NewServiceAuthMiddleware(serviceAuths)(handler)
 			req := httptest.NewRequest("GET", "/test", nil)
-			req.Header.Set("Authorization", tt.authHeader)
-			rr := httptest.NewRecorder()
-			authHandler.ServeHTTP(rr, req)
-
-			assert.Equal(t, tt.expectStatus, rr.Code)
-			assert.Equal(t, tt.expectServiceAuth, hasAuthInfo)
-			if tt.expectServiceAuth {
-				assert.Equal(t, tt.expectAuthInfo, actualAuthInfo)
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
 			}
+			rr := httptest.NewRecorder()
+			NewServiceAuthMiddleware(serverName, serviceAuths)(handler).ServeHTTP(rr, req)
+
+			assert.True(t, handlerCalled, "trier must always pass through to next handler")
+			assert.Equal(t, http.StatusOK, rr.Code, "trier must not write a status itself")
+			assert.Equal(t, tt.wantAuthInfo, gotHasAuthInfo)
+			if tt.wantAuthInfo {
+				assert.Equal(t, tt.wantAuthInfoEq, gotAuthInfo)
+				assert.Equal(t, tt.wantOAuthEmail, gotOAuthEmail, "should set oauth context to synthetic email")
+			} else {
+				assert.Empty(t, gotOAuthEmail, "no auth means no oauth context")
+			}
+			assert.Empty(t, rr.Header().Get("WWW-Authenticate"), "trier must not set WWW-Authenticate")
 		})
 	}
+}
+
+// TestServiceAuthMiddleware_BasicTimingEqualized verifies that Basic auth
+// always runs bcrypt regardless of whether the username is configured, so the
+// response timing does not leak which usernames exist.
+//
+// We don't measure absolute timing (too noisy in CI) — instead we measure the
+// timing GAP between known-user and unknown-user requests over many trials.
+// With the dummy-hash defense, both paths run one bcrypt; the median timing
+// gap should be a tiny fraction of a single bcrypt call. Without the defense,
+// the gap would be on the order of one bcrypt call (~tens of milliseconds at
+// DefaultCost).
+func TestServiceAuthMiddleware_BasicTimingEqualized(t *testing.T) {
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte("password123"), bcrypt.DefaultCost)
+	require.NoError(t, err)
+
+	mw := NewServiceAuthMiddleware("test-server", []config.ServiceAuth{{
+		Type:           config.ServiceAuthTypeBasic,
+		Name:           "alice",
+		Username:       "alice",
+		HashedPassword: config.Secret(hashedPassword),
+	}})
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	timeRequest := func(authHeader string) time.Duration {
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", authHeader)
+		rr := httptest.NewRecorder()
+		start := time.Now()
+		handler.ServeHTTP(rr, req)
+		return time.Since(start)
+	}
+
+	const trials = 5
+	known := make([]time.Duration, trials)
+	unknown := make([]time.Duration, trials)
+	for i := range trials {
+		known[i] = timeRequest("Basic " + base64.StdEncoding.EncodeToString([]byte("alice:wrongpass")))
+		unknown[i] = timeRequest("Basic " + base64.StdEncoding.EncodeToString([]byte("nobody:wrongpass")))
+	}
+
+	// Take medians to suppress GC/scheduler noise.
+	median := func(ds []time.Duration) time.Duration {
+		sorted := slices.Clone(ds)
+		slices.Sort(sorted)
+		return sorted[len(sorted)/2]
+	}
+	knownMed := median(known)
+	unknownMed := median(unknown)
+	gap := knownMed - unknownMed
+	if gap < 0 {
+		gap = -gap
+	}
+
+	// A single bcrypt at DefaultCost (10) takes ~50-100ms on typical hardware.
+	// If the dummy-hash defense were missing, unknown would skip bcrypt entirely
+	// and the gap would be roughly equal to knownMed. We assert the gap is well
+	// under half of knownMed — generous to absorb CI noise but tight enough to
+	// catch a regression that drops the dummy-hash call.
+	assert.Less(t, gap, knownMed/2,
+		"timing gap %v between known-user and unknown-user must be << bcrypt cost (known median %v, unknown median %v) — dummy-hash equalization regressed?",
+		gap, knownMed, unknownMed)
 }

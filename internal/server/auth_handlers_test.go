@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -86,13 +87,14 @@ func TestAuthenticationBoundaries(t *testing.T) {
 			ClientSecret: config.Secret("test-client-secret"),
 			RedirectURI:  "https://test.example.com/oauth/callback",
 		},
-		JWTSecret:       config.Secret(strings.Repeat("a", 32)),
-		EncryptionKey:   config.Secret(strings.Repeat("b", 32)),
-		TokenTTL:        time.Hour,
-		RefreshTokenTTL: 30 * 24 * time.Hour,
-		Storage:         "memory",
-		AllowedDomains:  []string{"example.com"},
-		AllowedOrigins:  []string{"https://test.example.com"},
+		JWTSecret:               config.Secret(strings.Repeat("a", 32)),
+		EncryptionKey:           config.Secret(strings.Repeat("b", 32)),
+		TokenTTL:                time.Hour,
+		RefreshTokenTTL:         30 * 24 * time.Hour,
+		Storage:                 "memory",
+		AllowedDomains:          []string{"example.com"},
+		AllowedOrigins:          []string{"https://test.example.com"},
+		AllowAnyRedirectURIHost: true,
 	}
 
 	// Create storage
@@ -238,13 +240,14 @@ func TestOAuthEndpointHandlers(t *testing.T) {
 			ClientSecret: config.Secret("test-client-secret"),
 			RedirectURI:  "https://test.example.com/oauth/callback",
 		},
-		JWTSecret:       config.Secret(strings.Repeat("a", 32)),
-		EncryptionKey:   config.Secret(strings.Repeat("b", 32)),
-		TokenTTL:        time.Hour,
-		RefreshTokenTTL: 30 * 24 * time.Hour,
-		Storage:         "memory",
-		AllowedDomains:  []string{"example.com"},
-		AllowedOrigins:  []string{"https://test.example.com"},
+		JWTSecret:               config.Secret(strings.Repeat("a", 32)),
+		EncryptionKey:           config.Secret(strings.Repeat("b", 32)),
+		TokenTTL:                time.Hour,
+		RefreshTokenTTL:         30 * 24 * time.Hour,
+		Storage:                 "memory",
+		AllowedDomains:          []string{"example.com"},
+		AllowedOrigins:          []string{"https://test.example.com"},
+		AllowAnyRedirectURIHost: true,
 	}
 
 	store := storage.NewMemoryStorage()
@@ -371,66 +374,171 @@ func TestOAuthEndpointHandlers(t *testing.T) {
 	})
 }
 
-func TestBearerTokenAuth(t *testing.T) {
-	// Unit test for bearer token authentication middleware
-	serviceAuths := []config.ServiceAuth{
-		{
-			Type:   config.ServiceAuthTypeBearer,
-			Tokens: []string{"valid-token-1", "valid-token-2"},
+// TestAuthorizeHandler_RedirectURIErrorPath verifies the fix for the open
+// redirect on /authorize: when redirect_uri itself is missing, unregistered,
+// or off the configured allowlist, the handler MUST return a direct error
+// (not a 302). RFC 6749 §3.1.2.4. When redirect_uri is valid but other
+// validation fails, the legitimate OAuth error channel (302 to the registered
+// URI with ?error=...) is preserved.
+func TestAuthorizeHandler_RedirectURIErrorPath(t *testing.T) {
+	oauthConfig := config.OAuthAuthConfig{
+		Kind:   config.AuthKindOAuth,
+		Issuer: "https://test.example.com",
+		IDP: config.IDPConfig{
+			Provider:     "google",
+			ClientID:     "test-client-id",
+			ClientSecret: config.Secret("test-client-secret"),
+			RedirectURI:  "https://test.example.com/oauth/callback",
 		},
+		JWTSecret:               config.Secret(strings.Repeat("a", 32)),
+		EncryptionKey:           config.Secret(strings.Repeat("b", 32)),
+		TokenTTL:                time.Hour,
+		RefreshTokenTTL:         30 * 24 * time.Hour,
+		Storage:                 "memory",
+		AllowedDomains:          []string{"example.com"},
+		AllowedRedirectURIHosts: []string{"https://legit.example"},
 	}
 
-	tests := []struct {
-		name         string
-		authHeader   string
-		expectStatus int
-	}{
-		{
-			name:         "valid token 1",
-			authHeader:   "Bearer valid-token-1",
-			expectStatus: http.StatusOK,
-		},
-		{
-			name:         "valid token 2",
-			authHeader:   "Bearer valid-token-2",
-			expectStatus: http.StatusOK,
-		},
-		{
-			name:         "invalid token",
-			authHeader:   "Bearer invalid-token",
-			expectStatus: http.StatusUnauthorized,
-		},
-		{
-			name:         "no auth header",
-			authHeader:   "",
-			expectStatus: http.StatusUnauthorized,
-		},
-		{
-			name:         "malformed header",
-			authHeader:   "InvalidFormat",
-			expectStatus: http.StatusUnauthorized,
-		},
+	store := storage.NewMemoryStorage()
+	jwtSecret, err := oauth.GenerateJWTSecret(string(oauthConfig.JWTSecret))
+	require.NoError(t, err)
+	authServer, err := oauth.NewAuthorizationServer(oauth.AuthorizationServerConfig{
+		JWTSecret:       jwtSecret,
+		Issuer:          oauthConfig.Issuer,
+		AccessTokenTTL:  oauthConfig.TokenTTL,
+		RefreshTokenTTL: oauthConfig.RefreshTokenTTL,
+	})
+	require.NoError(t, err)
+	sessionEncryptor, err := oauth.NewSessionEncryptor([]byte(oauthConfig.EncryptionKey))
+	require.NoError(t, err)
+	serviceOAuthClient := auth.NewServiceOAuthClient(store, "https://test.example.com", []byte(strings.Repeat("k", 32)))
+
+	authHandlers := NewAuthHandlers(
+		authServer,
+		oauthConfig,
+		&mockIDPProvider{},
+		store,
+		sessionEncryptor,
+		map[string]*config.MCPClientConfig{},
+		serviceOAuthClient,
+	)
+
+	registeredURI := "https://legit.example/cb"
+	_, err = store.CreateClient(context.Background(), "victim-client", []string{registeredURI}, []string{"read"}, oauthConfig.Issuer)
+	require.NoError(t, err)
+
+	verifier := strings.Repeat("a", 64)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	// Helper to assert that the response is NOT a 302 to a host substring.
+	assertNoRedirectTo := func(t *testing.T, rec *httptest.ResponseRecorder, hostSubstr string) {
+		t.Helper()
+		if rec.Code == http.StatusFound || rec.Code == http.StatusSeeOther {
+			loc := rec.Header().Get("Location")
+			assert.NotContains(t, loc, hostSubstr,
+				"open redirect: server 302'd to a redirect_uri that should have been rejected (Location: %s)", loc)
+		}
+		assert.GreaterOrEqual(t, rec.Code, 400, "expected a direct error response, got status %d", rec.Code)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusOK)
-			})
+	t.Run("rejects unregistered redirect_uri without redirecting", func(t *testing.T) {
+		params := url.Values{
+			"client_id":             {"victim-client"},
+			"response_type":         {"code"},
+			"redirect_uri":          {"https://attacker.example/steal"},
+			"state":                 {strings.Repeat("s", 16)},
+			"code_challenge":        {challenge},
+			"code_challenge_method": {"S256"},
+			"resource":              {"https://test.example.com/svc"},
+		}
+		req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+		rec := httptest.NewRecorder()
+		authHandlers.AuthorizeHandler(rec, req)
+		assertNoRedirectTo(t, rec, "attacker.example")
+	})
 
-			authHandler := NewServiceAuthMiddleware(serviceAuths)(handler)
+	t.Run("rejects off-allowlist redirect_uri without redirecting", func(t *testing.T) {
+		// Register a client whose redirect_uri sits outside the current
+		// allowlist (simulating stale data registered before policy tightening).
+		_, err := store.CreateClient(context.Background(), "stale-client", []string{"https://stale.example/cb"}, []string{"read"}, oauthConfig.Issuer)
+		require.NoError(t, err)
 
-			req := httptest.NewRequest("GET", "/test", nil)
-			if tt.authHeader != "" {
-				req.Header.Set("Authorization", tt.authHeader)
-			}
+		params := url.Values{
+			"client_id":             {"stale-client"},
+			"response_type":         {"code"},
+			"redirect_uri":          {"https://stale.example/cb"},
+			"state":                 {strings.Repeat("s", 16)},
+			"code_challenge":        {challenge},
+			"code_challenge_method": {"S256"},
+			"resource":              {"https://test.example.com/svc"},
+		}
+		req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+		rec := httptest.NewRecorder()
+		authHandlers.AuthorizeHandler(rec, req)
+		assertNoRedirectTo(t, rec, "stale.example")
+	})
 
-			rec := httptest.NewRecorder()
-			authHandler.ServeHTTP(rec, req)
+	t.Run("rejects javascript scheme redirect_uri without redirecting", func(t *testing.T) {
+		// A client could only have this in storage if registered before the
+		// scheme rule was enforced; verify defense-in-depth at /authorize.
+		_, err := store.CreateClient(context.Background(), "js-client", []string{"javascript:alert(1)"}, []string{"read"}, oauthConfig.Issuer)
+		require.NoError(t, err)
 
-			assert.Equal(t, tt.expectStatus, rec.Code)
-		})
-	}
+		params := url.Values{
+			"client_id":             {"js-client"},
+			"response_type":         {"code"},
+			"redirect_uri":          {"javascript:alert(1)"},
+			"state":                 {strings.Repeat("s", 16)},
+			"code_challenge":        {challenge},
+			"code_challenge_method": {"S256"},
+			"resource":              {"https://test.example.com/svc"},
+		}
+		req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+		rec := httptest.NewRecorder()
+		authHandlers.AuthorizeHandler(rec, req)
+		assert.GreaterOrEqual(t, rec.Code, 400, "javascript: redirect_uri must not result in a 302")
+		if rec.Code == http.StatusFound {
+			t.Errorf("must not 302 to javascript: URI; Location=%s", rec.Header().Get("Location"))
+		}
+	})
+
+	t.Run("rejects missing redirect_uri without redirecting", func(t *testing.T) {
+		params := url.Values{
+			"client_id":             {"victim-client"},
+			"response_type":         {"code"},
+			"state":                 {strings.Repeat("s", 16)},
+			"code_challenge":        {challenge},
+			"code_challenge_method": {"S256"},
+			"resource":              {"https://test.example.com/svc"},
+		}
+		req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+		rec := httptest.NewRecorder()
+		authHandlers.AuthorizeHandler(rec, req)
+		assert.GreaterOrEqual(t, rec.Code, 400)
+	})
+
+	t.Run("preserves OAuth error channel when redirect_uri is valid", func(t *testing.T) {
+		// redirect_uri is registered AND on allowlist; failure is response_type.
+		// The legitimate OAuth error redirect to the *registered* URI must
+		// still happen — that's the standard OAuth error reporting channel.
+		params := url.Values{
+			"client_id":             {"victim-client"},
+			"response_type":         {"token"}, // unsupported
+			"redirect_uri":          {registeredURI},
+			"state":                 {strings.Repeat("s", 16)},
+			"code_challenge":        {challenge},
+			"code_challenge_method": {"S256"},
+			"resource":              {"https://test.example.com/svc"},
+		}
+		req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+		rec := httptest.NewRecorder()
+		authHandlers.AuthorizeHandler(rec, req)
+		require.Equal(t, http.StatusFound, rec.Code, "expected 302 error redirect to registered URI")
+		loc := rec.Header().Get("Location")
+		assert.Contains(t, loc, "legit.example/cb")
+		assert.Contains(t, loc, "error=")
+	})
 }
 
 func TestListTokensAuthType(t *testing.T) {
@@ -671,6 +779,19 @@ func TestValidateAccess(t *testing.T) {
 			identity:       &idp.Identity{Domain: "other.com", Organizations: []string{"my-org"}},
 			wantErr:        true,
 			errContains:    "domain 'other.com' is not allowed",
+		},
+		{
+			name:        "service_auth_domain_rejected_no_restrictions",
+			identity:    &idp.Identity{Domain: "serviceauth.mcpfront.alt", Organizations: []string{"any-org"}},
+			wantErr:     true,
+			errContains: "reserved for service-to-service authentication",
+		},
+		{
+			name:           "service_auth_domain_rejected_even_when_explicitly_allowed",
+			allowedDomains: []string{"serviceauth.mcpfront.alt"},
+			identity:       &idp.Identity{Domain: "serviceauth.mcpfront.alt"},
+			wantErr:        true,
+			errContains:    "reserved for service-to-service authentication",
 		},
 	}
 
