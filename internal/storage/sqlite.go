@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -32,6 +34,16 @@ func NewSQLiteStorage(ctx context.Context, dbPath string, encryptor crypto.Encry
 	}
 	if dbPath == "" {
 		return nil, fmt.Errorf("database path is required")
+	}
+
+	// modernc.org/sqlite does not create missing parent directories and
+	// reports SQLITE_CANTOPEN ("unable to open database file") when they are
+	// absent. Create the directory up front so a fresh path (or freshly
+	// mounted volume) works without manual setup.
+	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("failed to create SQLite directory %q: %w", dir, err)
+		}
 	}
 
 	db, err := sql.Open("sqlite", dbPath+"?_busy_timeout=5000")
