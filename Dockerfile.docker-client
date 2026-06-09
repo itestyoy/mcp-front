@@ -34,8 +34,12 @@ RUN addgroup -g 1000 -S mcpfront && \
 # Copy binary from builder
 COPY --from=builder /app/mcp-front /usr/local/bin/mcp-front
 
-# Create config directory
-RUN mkdir -p /app && chown -R mcpfront:mcpfront /app
+# Create config and data directories. /app/sqlite and /app/data are typically
+# bind/volume mount points; pre-creating them here ensures a freshly
+# initialized named volume inherits mcpfront ownership instead of defaulting
+# to root, which would make the non-root container unable to write (e.g. the
+# SQLite database file).
+RUN mkdir -p /app/sqlite /app/data && chown -R mcpfront:mcpfront /app
 
 # Add mcpfront user to docker group (will be created when socket is mounted)
 # This allows the user to access the Docker socket
